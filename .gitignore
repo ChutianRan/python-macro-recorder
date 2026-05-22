@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 macro_records.json
+build/
+dist/
+*.spec

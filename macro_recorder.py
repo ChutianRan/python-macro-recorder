@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import time
 import tkinter as tk
@@ -8,7 +9,10 @@ from tkinter import messagebox, simpledialog, ttk
 from pynput import keyboard, mouse
 
 
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
 RECORDS_FILE = APP_DIR / "macro_records.json"
 
 CONTROL_KEYS = {
@@ -72,6 +76,10 @@ def text_to_key_data(text):
 
 def key_data_equal(left, right):
     return left["kind"] == right["kind"] and left["value"] == right["value"]
+
+
+def key_data_id(data):
+    return (data["kind"], data["value"])
 
 
 def events_to_modules(events):
@@ -634,6 +642,7 @@ class MacroApp(tk.Tk):
         self.playing = False
         self.record_start_time = 0.0
         self.record_events = []
+        self.record_pressed_keys = set()
         self.last_move_time = 0.0
         self.mouse_listener = None
         self.keyboard_listener = None
@@ -642,6 +651,7 @@ class MacroApp(tk.Tk):
         self.stop_playback = threading.Event()
 
         self.status_text = tk.StringVar(value="准备就绪")
+        self.play_count_var = tk.StringVar(value="1")
         self.selected_record_id = None
         self.window_bounds = (0, 0, 0, 0)
 
@@ -658,7 +668,7 @@ class MacroApp(tk.Tk):
 
         top = ttk.Frame(self, padding=(14, 14, 14, 8))
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(4, weight=1)
+        top.columnconfigure(6, weight=1)
 
         self.start_button = ttk.Button(top, text="开始记录 (F9)", command=self.start_recording)
         self.start_button.grid(row=0, column=0, padx=(0, 8))
@@ -666,14 +676,19 @@ class MacroApp(tk.Tk):
         self.finish_button = ttk.Button(top, text="完成记录 (F10)", command=self.finish_recording, state="disabled")
         self.finish_button.grid(row=0, column=1, padx=(0, 8))
 
-        self.play_once_button = ttk.Button(top, text="运行一次", command=lambda: self.play_selected(loop=False))
-        self.play_once_button.grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(top, text="运行次数").grid(row=0, column=2, padx=(0, 4))
 
-        self.play_loop_button = ttk.Button(top, text="无限重复", command=lambda: self.play_selected(loop=True))
-        self.play_loop_button.grid(row=0, column=3, padx=(0, 8))
+        self.play_count_entry = ttk.Entry(top, textvariable=self.play_count_var, width=6)
+        self.play_count_entry.grid(row=0, column=3, padx=(0, 8))
+
+        self.play_count_button = ttk.Button(top, text="运行", command=self.play_selected_count)
+        self.play_count_button.grid(row=0, column=4, padx=(0, 8))
+
+        self.play_loop_button = ttk.Button(top, text="无限重复", command=lambda: self.play_selected(repeat_count=None))
+        self.play_loop_button.grid(row=0, column=5, padx=(0, 8))
 
         self.stop_button = ttk.Button(top, text="停止运行 (F12)", command=self.stop_running, state="disabled")
-        self.stop_button.grid(row=0, column=4, sticky="w")
+        self.stop_button.grid(row=0, column=6, sticky="w")
 
         main = ttk.Frame(self, padding=(14, 6, 14, 8))
         main.grid(row=1, column=0, sticky="nsew")
@@ -743,7 +758,8 @@ class MacroApp(tk.Tk):
 
         self.start_button.configure(state="normal" if idle else "disabled")
         self.finish_button.configure(state="normal" if self.recording else "disabled")
-        self.play_once_button.configure(state="normal" if idle and has_selection else "disabled")
+        self.play_count_entry.configure(state="normal" if idle else "disabled")
+        self.play_count_button.configure(state="normal" if idle and has_selection else "disabled")
         self.play_loop_button.configure(state="normal" if idle and has_selection else "disabled")
         self.edit_button.configure(state="normal" if idle and has_selection else "disabled")
         self.rename_button.configure(state="normal" if idle and has_selection else "disabled")
@@ -764,6 +780,7 @@ class MacroApp(tk.Tk):
 
         self.recording = True
         self.record_events = []
+        self.record_pressed_keys.clear()
         self.record_start_time = time.perf_counter()
         self.last_move_time = 0.0
         self.status_text.set("正在记录输入，按 F10 完成记录")
@@ -797,11 +814,13 @@ class MacroApp(tk.Tk):
         if not self.recording:
             return
 
+        self._release_recorded_keys()
         self.recording = False
         self._stop_record_listeners()
 
         events = list(self.record_events)
         self.record_events = []
+        self.record_pressed_keys.clear()
 
         if not events:
             self.status_text.set("没有录到任何可保存的输入")
@@ -833,6 +852,17 @@ class MacroApp(tk.Tk):
             return
         event["time"] = round(self._record_time(), 5)
         self.record_events.append(event)
+
+    def _release_recorded_keys(self):
+        for key_kind, key_value in list(self.record_pressed_keys):
+            self._add_event(
+                {
+                    "type": "key",
+                    "action": "release",
+                    "key": {"kind": key_kind, "value": key_value},
+                }
+            )
+        self.record_pressed_keys.clear()
 
     def _is_inside_window(self, x, y):
         left, top, right, bottom = self.window_bounds
@@ -872,12 +902,22 @@ class MacroApp(tk.Tk):
             return False
         if key in CONTROL_KEYS:
             return
-        self._add_event({"type": "key", "action": "press", "key": key_to_data(key)})
+        key_data = key_to_data(key)
+        key_id = key_data_id(key_data)
+        if key_id in self.record_pressed_keys:
+            return
+        self.record_pressed_keys.add(key_id)
+        self._add_event({"type": "key", "action": "press", "key": key_data})
 
     def _on_key_release(self, key):
         if key in CONTROL_KEYS:
             return
-        self._add_event({"type": "key", "action": "release", "key": key_to_data(key)})
+        key_data = key_to_data(key)
+        key_id = key_data_id(key_data)
+        if key_id not in self.record_pressed_keys:
+            return
+        self.record_pressed_keys.remove(key_id)
+        self._add_event({"type": "key", "action": "release", "key": key_data})
 
     def get_selected_record(self):
         if not self.selected_record_id:
@@ -887,7 +927,20 @@ class MacroApp(tk.Tk):
                 return record
         return None
 
-    def play_selected(self, loop):
+    def play_selected_count(self):
+        try:
+            repeat_count = int(self.play_count_var.get())
+        except ValueError:
+            messagebox.showerror("次数无效", "运行次数必须是正整数。", parent=self)
+            return
+
+        if repeat_count <= 0:
+            messagebox.showerror("次数无效", "运行次数必须大于 0。", parent=self)
+            return
+
+        self.play_selected(repeat_count=repeat_count)
+
+    def play_selected(self, repeat_count):
         if self.recording or self.playing:
             return
 
@@ -898,29 +951,39 @@ class MacroApp(tk.Tk):
 
         self.playing = True
         self.stop_playback.clear()
-        mode = "无限重复" if loop else "运行一次"
+        mode = "无限重复" if repeat_count is None else f"运行 {repeat_count} 次"
         self.status_text.set(f"正在{mode}：{record['name']}，按 F12 可停止")
         self._update_buttons()
 
         self.play_thread = threading.Thread(
             target=self._play_worker,
-            args=(record, loop),
+            args=(record, repeat_count),
             daemon=True,
         )
         self.play_thread.start()
 
-    def _play_worker(self, record, loop):
+    def _play_worker(self, record, repeat_count):
         keyboard_stop_listener = keyboard.Listener(on_press=self._on_playback_hotkey)
         keyboard_stop_listener.start()
 
         try:
-            while not self.stop_playback.is_set():
-                self._play_events(record["events"])
-                if not loop:
-                    break
+            if repeat_count is None:
+                while not self.stop_playback.is_set():
+                    self._play_events(record["events"])
+            else:
+                for index in range(repeat_count):
+                    if self.stop_playback.is_set():
+                        break
+                    self.after(0, self._set_playback_progress, record["name"], index + 1, repeat_count)
+                    self._play_events(record["events"])
         finally:
             keyboard_stop_listener.stop()
             self.after(0, self._playback_finished)
+
+    def _set_playback_progress(self, record_name, current, total):
+        if not self.playing:
+            return
+        self.status_text.set(f"正在运行 {current}/{total} 次：{record_name}，按 F12 可停止")
 
     def _on_playback_hotkey(self, key):
         if key == keyboard.Key.f12:
